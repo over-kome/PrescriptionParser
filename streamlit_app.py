@@ -1,6 +1,6 @@
 import streamlit as st
 
-from parser import format_simple, parse_medication_list
+from parser import format_simple, parse_medication_list, sort_clinical
 
 st.set_page_config(page_title="Prescription Parser", layout="wide")
 st.title("Prescription Parser")
@@ -22,7 +22,7 @@ with left:
 
 with right:
     st.markdown("**Saída**")
-    meds = parse_medication_list(raw) if raw.strip() else []
+    meds = sort_clinical(parse_medication_list(raw)) if raw.strip() else []
     output = "\n\n".join(format_simple(m) for m in meds)
     if output:
         st.code(output, language=None)

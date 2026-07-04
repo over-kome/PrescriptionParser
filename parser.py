@@ -689,13 +689,23 @@ def parse_medication_list(text: str) -> list[ParsedMedication]:
 # Output target is "Name Dose M-T-N" (e.g. "Losartana 50 mg 1-0-1").
 # ---------------------------------------------------------------------------
 
-_MESSY_DETECT_RE = re.compile(
-    r"Per[ií]odo:[^\n]*Quantidade:\s*\d+",
+_MESSY_ROUTE_RE = re.compile(
+    r"(Oral|Subcut[âa]nea|Intramuscular|T[óo]pica|Nasal|Inalat[óo]ria|Oftalmica|Auricular|Vaginal|Retal)",
     re.IGNORECASE,
 )
 
-_MESSY_ROUTE_RE = re.compile(
-    r"(Oral|Subcut[âa]nea|Intramuscular|T[óo]pica|Nasal|Inalat[óo]ria|Oftalmica|Auricular)",
+# A "dosing line" starts with a quantity and ends with a concatenated route+form
+# (e.g. "1 comprimido, a cada 12 horasOralComprimido").
+_DOSING_LINE_RE = re.compile(
+    r"^\d+(?:[,\.]\d+)?.*?"
+    r"(?:Oral|Subcut[âa]nea|Intramuscular|T[óo]pica|Nasal|Inalat[óo]ria|Oftalmica|Auricular|Vaginal|Retal)"
+    r"\s*(?:Comprimido|C[áa]psula|Solu[çc][ãa]o|Suspens[aã]o|Xarope|Ampola|Amp|Gotas|Spray|Creme|Pomada|Sach[êe]|P[óo]|Adesivo)",
+    re.IGNORECASE,
+)
+
+# Lines to skip when looking backward for a med name.
+_SKIP_LINE_RE = re.compile(
+    r"^\s*(?:={3,}|-{3,}|Per[ií]odo\s*:|Quantidade\s*:|Recomenda[çc][õo]es\s*:?)",
     re.IGNORECASE,
 )
 
@@ -717,7 +727,7 @@ _NAME_ALIASES: dict[str, str] = {
 
 
 def _is_messy_format(text: str) -> bool:
-    return bool(_MESSY_DETECT_RE.search(text))
+    return any(_DOSING_LINE_RE.match(l.strip()) for l in text.split("\n") if l.strip())
 
 
 def _normalize_qty(q: str) -> str:
@@ -731,27 +741,41 @@ def _normalize_qty(q: str) -> str:
 
 
 def _normalize_dose(dose: str) -> str:
-    """'500MG' → '500 mg', '2000 UI' → '2000 ui', '100 ui/ml' → '100 ui/ml'."""
-    m = re.match(r"(\d+(?:[,\.]\d+)?)\s*(.+)$", dose.strip())
-    if not m:
-        return dose.strip()
-    return f"{m.group(1)} {m.group(2).lower().strip()}"
+    """'500MG' → '500 mg', '2000 UI' → '2000 ui', '100 ui/ml' → '100 ui/ml',
+    '7.000 ui' → '7000 ui' (Brazilian thousands separator)."""
+    dose = dose.strip()
+    # Brazilian thousands separator: '.' followed by exactly 3 digits, no other decimals
+    m = re.match(r"(\d+)([,\.])(\d+)\s*(.+)$", dose)
+    if m:
+        whole, sep, frac, unit = m.groups()
+        if sep == "." and len(frac) == 3:
+            number = f"{whole}{frac}"
+        else:
+            number = f"{whole}{sep}{frac}"
+        return f"{number} {unit.lower().strip()}"
+    m = re.match(r"(\d+)\s*(.+)$", dose)
+    if m:
+        return f"{m.group(1)} {m.group(2).lower().strip()}"
+    return dose
 
 
 def _normalize_name(name: str) -> str:
-    """Strip salt forms, prefer generic from parens, titlecase ALL-CAPS, apply aliases."""
+    """Strip parenthetical alt name, salt forms; titlecase ALL-CAPS; apply aliases."""
     name = name.strip()
 
-    # "FORXIGA (DAPAGLIFLOZINA)" → "DAPAGLIFLOZINA" (prefer generic in parens)
-    paren_m = re.search(r"\(([^)]+)\)", name)
+    # Handle a parenthetical alt name: "FORXIGA (DAPAGLIFLOZINA)" prefers inner,
+    # "Colecalciferol (Vitamina D3)" keeps outer (paren is just a note).
+    paren_m = re.search(r"\s*\(([^)]+)\)", name)
     if paren_m:
-        inside = paren_m.group(1).strip()
-        if len(inside) >= 4 and not re.search(r"\d", inside):
-            name = inside
+        inner = paren_m.group(1).strip()
+        outer = (name[: paren_m.start()] + name[paren_m.end() :]).strip()
+        if outer.isupper() and len(inner) >= 4 and not re.search(r"\d", inner):
+            name = inner
+        else:
+            name = outer
 
     name = _SALT_FORMS_RE.sub("", name).strip(" ,")
 
-    # Titlecase if input is shouting
     if name.isupper() and len(name) > 3:
         lowers = {"de", "da", "do", "das", "dos", "e"}
         name = " ".join(
@@ -816,8 +840,23 @@ def _dosing_to_mtn(dosing_segment: str) -> str | None:
         return f"0-{qty}-0"
     if re.search(r"pela\s+noite", s, re.IGNORECASE):
         return f"0-0-{qty}"
+    # Weekly / monthly — collapse to "Nx/semana", "Nx/mês"
+    if re.search(r"(?:1\s+vez\s+)?a\s+cada\s+1\s+semana|semanal", s, re.IGNORECASE):
+        return f"{qty}x/semana"
+    if re.search(r"(?:1\s+vez\s+)?a\s+cada\s+1\s+m[eê]s|mensal", s, re.IGNORECASE):
+        return f"{qty}x/mês"
+    # "N vezes ao dia" — 2x → M+N, 3x → M+T+N
+    vezes_m = re.search(r"(\d+)\s*vezes?\s+ao\s+dia", s, re.IGNORECASE)
+    if vezes_m:
+        n = int(vezes_m.group(1))
+        if n == 1:
+            return f"{qty}-0-0"
+        if n == 2:
+            return f"{qty}-0-{qty}"
+        if n == 3:
+            return f"{qty}-{qty}-{qty}"
+        return None
     if re.search(r"a\s+cada\s+1\s+dia|1\s+vez\s+ao\s+dia", s, re.IGNORECASE):
-        # Once-daily with no specific time → assume morning
         return f"{qty}-0-0"
     return None
 
@@ -850,29 +889,31 @@ def _parse_messy_block(name_line: str, dosing_line: str) -> ParsedMedication:
 
 
 def _parse_messy_list(text: str) -> list[ParsedMedication]:
+    """Split the messy format into blocks by anchoring on dosing lines.
+
+    For every line that looks like a dosing line, walk backward past blank/
+    separator/Período/Quantidade/Recomendações noise to find the nearest
+    line that carries a dose (that's the name+dose line).
+    """
     lines = [l.rstrip() for l in text.split("\n")]
     results: list[ParsedMedication] = []
 
-    i = 0
-    while i < len(lines):
-        line = lines[i].strip()
-        if not line:
-            i += 1
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if not _DOSING_LINE_RE.match(stripped):
             continue
-        # Standalone recommendation lines aren't med starts
-        if re.match(r"recomenda[çc][õo]es\s*:", line, re.IGNORECASE):
-            i += 1
-            continue
-
-        j = i + 1
-        while j < len(lines) and not lines[j].strip():
-            j += 1
-
-        if j < len(lines) and _MESSY_DETECT_RE.search(lines[j]):
-            results.append(_parse_messy_block(line, lines[j].strip()))
-            i = j + 1
-        else:
-            i += 1
+        for j in range(i - 1, -1, -1):
+            candidate = lines[j].strip()
+            if not candidate:
+                continue
+            if _DOSING_LINE_RE.match(candidate):
+                break  # ran into the previous med's dosing → give up
+            if _SKIP_LINE_RE.match(candidate):
+                continue
+            if _DOSE_RE.search(candidate):
+                results.append(_parse_messy_block(candidate, stripped))
+                break
+            # Some other unrecognized line — keep walking
 
     return results
 
@@ -887,3 +928,109 @@ def format_simple(med: ParsedMedication) -> str:
     elif med.frequency:
         parts.append(med.frequency)
     return " ".join(p for p in parts if p)
+
+
+# ---------------------------------------------------------------------------
+# Clinical sort — group meds by system/class in a conventional review order.
+# Priority buckets are small integers so it's easy to insert new classes.
+# Unknown meds fall to the end (priority 500).
+# ---------------------------------------------------------------------------
+
+import unicodedata
+
+
+def _strip_accents(s: str) -> str:
+    return "".join(
+        c for c in unicodedata.normalize("NFD", s)
+        if unicodedata.category(c) != "Mn"
+    )
+
+
+_CATEGORIES: list[tuple[int, list[str]]] = [
+    # Cardiovascular — anti-HTN
+    (10, ["losartana", "valsartana", "irbesartana", "olmesartana", "candesartana",
+          "telmisartana", "enalapril", "captopril", "ramipril", "lisinopril"]),
+    (11, ["anlodipino", "amlodipina", "nifedipino", "manidipino", "levanlodipino"]),
+    (12, ["carvedilol", "metoprolol", "bisoprolol", "atenolol", "propranolol",
+          "nebivolol"]),
+    (13, ["hidroclorotiazida", "hctz", "clortalidona", "indapamida",
+          "furosemida", "espironolactona"]),
+    (14, ["isossorbida", "hidralazina", "digoxina"]),
+    # Antiplatelet / anticoagulant
+    (20, ["ácido acetilsalicílico", "aas", "clopidogrel", "ticagrelor",
+          "prasugrel"]),
+    (21, ["varfarina", "warfarin", "rivaroxabana", "apixabana", "dabigatrana",
+          "edoxabana", "enoxaparina"]),
+    # Dyslipidemia
+    (30, ["sinvastatina", "atorvastatina", "rosuvastatina", "pravastatina",
+          "pitavastatina", "ezetimiba", "fenofibrato", "ciprofibrato"]),
+    # Endocrine — DM
+    (40, ["metformina", "glifage xr", "glifage"]),
+    (41, ["gliclazida", "glimepirida", "glibenclamida"]),
+    (42, ["dapagliflozina", "empagliflozina", "canagliflozina"]),
+    (43, ["sitagliptina", "linagliptina", "vildagliptina", "saxagliptina"]),
+    (44, ["liraglutida", "semaglutida", "dulaglutida"]),
+    (45, ["insulina humana nph", "insulina humana regular", "insulina glargina",
+          "insulina detemir", "insulina asparte", "insulina lispro",
+          "insulina degludeca"]),
+    # Endocrine — thyroid
+    (50, ["levotiroxina", "propiltiouracil", "metimazol"]),
+    # Bone / renal / mineral
+    (60, ["colecalciferol", "calcitriol", "carbonato de cálcio",
+          "bicarbonato de sódio", "sevelamer"]),
+    # GI
+    (70, ["omeprazol", "pantoprazol", "esomeprazol", "lansoprazol",
+          "rabeprazol"]),
+    (71, ["ranitidina", "famotidina"]),
+    (72, ["lactulose", "bisacodil", "polietilenoglicol", "psyllium"]),
+    # Urologic
+    (73, ["oxibutinina", "tolterodina", "solifenacina", "tansulosina",
+          "finasterida", "dutasterida"]),
+    # Rheumatology / gout
+    (80, ["alopurinol", "colchicina", "febuxostate"]),
+    # Neuro / psych
+    (90, ["sertralina", "fluoxetina", "escitalopram", "citalopram",
+          "paroxetina", "duloxetina", "venlafaxina", "desvenlafaxina",
+          "nortriptilina", "amitriptilina", "bupropiona", "mirtazapina",
+          "trazodona"]),
+    (91, ["quetiapina", "olanzapina", "risperidona", "aripiprazol",
+          "haloperidol", "levomepromazina", "clozapina", "ziprasidona"]),
+    (92, ["clonazepam", "diazepam", "alprazolam", "lorazepam", "midazolam",
+          "bromazepam", "zolpidem"]),
+    (93, ["pregabalina", "gabapentina"]),
+    (94, ["fenobarbital", "carbamazepina", "valproato", "lamotrigina",
+          "topiramato", "oxcarbazepina", "levetiracetam"]),
+    # Symptomatic / PRN
+    (100, ["dipirona", "paracetamol", "ibuprofeno", "nimesulida", "diclofenaco",
+           "naproxeno"]),
+]
+
+_MED_PRIORITY: dict[str, int] = {
+    _strip_accents(name.lower()): prio
+    for prio, names in _CATEGORIES
+    for name in names
+}
+# Longest keys first — "insulina humana nph" beats "insulina" as a substring match
+_MED_PRIORITY_SORTED = sorted(_MED_PRIORITY.items(), key=lambda kv: -len(kv[0]))
+
+_DEFAULT_PRIORITY = 500
+
+
+def _sort_key(med: ParsedMedication) -> tuple[int, str]:
+    name_lc = _strip_accents(med.medication_name.lower().strip())
+    if name_lc in _MED_PRIORITY:
+        return (_MED_PRIORITY[name_lc], name_lc)
+    for key, prio in _MED_PRIORITY_SORTED:
+        if key in name_lc:
+            return (prio, name_lc)
+    return (_DEFAULT_PRIORITY, name_lc)
+
+
+def sort_clinical(meds: list[ParsedMedication]) -> list[ParsedMedication]:
+    """Sort meds into a conventional clinical review order.
+
+    Buckets, roughly: cardiovascular → antiplatelet/anticoag → dyslipidemia →
+    diabetes → thyroid → bone/renal → GI → urologic → rheum → psych/neuro →
+    symptomatic/PRN. Unknown meds go last, alphabetical within a bucket.
+    """
+    return sorted(meds, key=_sort_key)
